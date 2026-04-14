@@ -3,17 +3,26 @@ src/features/builder.py
 ────────────────────────
 Builds the complete feature table for any cohort year.
 
-The core function is build_cohort_features(bills, emails, cc, rc, renewal_year).
+The core function is build_cohort_features(bills, cc, rc, renewal_year).
 Pass renewal_year=2024 for training, renewal_year=2025 for test/predict.
 Both produce identical column structure.
+
+Post-renewal cohort definition:
+  A customer is included if their Closed_Date falls within 4 weeks (28 days)
+  after their Prospect_Renewal_Date in the given Renewal_Year.
+  Label: Prospect_Outcome == 'Churned' → 1, 'Won' → 0.
+  'Open' outcomes are excluded (undecided within window).
+
+NOTE: Email data is NOT used.
+  emails.year = Renewal_Year + 1, meaning emails arrive AFTER the renewal
+  decision is already made. Using them would be temporal leakage.
 
 Feature groups:
   1. Billing structural     — band, tenure, anchorings, price, payment
   2. Billing derived        — price change %, first year flag, score delta
-  3. Email behavioural      — sentiment, flags, engagement (prior_year window)
-  4. CC call behavioural    — support call signals, sentiment trajectory
-  5. Renewal call signals   — friction, discount, competitor (safe cols only)
-  6. Cross-file composite   — combined signals across multiple files
+  3. CC call behavioural    — support call signals, sentiment trajectory
+  4. Renewal call signals   — friction, discount, competitor (safe cols only)
+  5. Cross-file composite   — combined signals across multiple files
 
 LEAKAGE COLUMNS never used:
   Membership_Renewal_Decision, Churn_Category,
@@ -37,37 +46,59 @@ BAND_ORDER = {
     "Band J": 13, "Group": 0,
 }
 
+# Columns to keep from billing data.
+# POST-OUTCOME columns are EXCLUDED to prevent data leakage:
+#   Total_Net_Paid         -- $0 for churned (they didn't pay)
+#   Payment_Method         -- UNKNOWN for churned (no payment set up)
+#   Payment_Timeframe      -- null for churned (no payment made)
+#   Current_World_Pay_Token -- payment token (post-outcome)
+#   Total_Renewal_Score_New -- updated after outcome decided (corr=-0.66)
+#   Status_Scores          -- post-outcome status (corr=-0.66)
+#   Tenure_Scores          -- post-outcome (corr=-0.43)
 BILLING_KEEP_COLS = [
     "Co_Ref", "Renewal_Year", "Band", "Tenure_Years", "Current_Anchorings",
-    "Connection_Qty", "Discount_Amount", "Total_Net_Paid", "Last_Total_Net_Paid",
-    "Current_Auto_Renewal_Flag", "Payment_Method", "Auto_Renewal_Score",
-    "Total_Renewal_Score_New", "Renewal_Score_At_Release", "Sustainability_Score",
-    "Last_Band", "Prospect_Outcome", "Current_World_Pay_Token", "Payment_Timeframe",
-    "#_of_Connection",
+    "Connection_Qty", "Discount_Amount", "Last_Total_Net_Paid",
+    "Current_Auto_Renewal_Flag", "Auto_Renewal_Score",
+    "Renewal_Score_At_Release", "Sustainability_Score",
+    "Last_Band", "Prospect_Outcome",
+    "#_of_Connection", "Prospect_Renewal_Date", "Closed_Date",
 ]
 
 DROP_BEFORE_TRAINING = [
-    "Co_Ref", "Renewal_Year", "Prospect_Outcome", "outcome_next_year",
-    "churn_label", "Band", "Payment_Method", "Current_Auto_Renewal_Flag",
-    "Last_Band", "Current_World_Pay_Token", "Current_Anchor_List", "Prospect_Status",
+    "Co_Ref", "Renewal_Year", "Prospect_Outcome", "outcome_post_renewal",
+    "churn_label", "Band", "Current_Auto_Renewal_Flag",
+    "Last_Band", "Current_Anchor_List", "Prospect_Status",
+    "Prospect_Renewal_Date", "Closed_Date",
 ]
 
 
 def build_billing_features(bills: pd.DataFrame, renewal_year: int) -> pd.DataFrame:
-    """Extract Won customers and build all billing-derived features."""
-    base = bills[
-        (bills["Renewal_Year"] == renewal_year) &
-        (bills["Prospect_Outcome"] == "Won")
-    ][[c for c in BILLING_KEEP_COLS if c in bills.columns]].copy()
+    """Extract customers whose deal closed within 4 weeks after Prospect_Renewal_Date.
+
+    Includes Won and Churned outcomes only (Open excluded).
+    """
+    yr = bills[bills["Renewal_Year"] == renewal_year].copy()
+
+    # ── 4-week post-renewal window ───────────────────────────────────────────
+    yr["_closed_within_4w"] = (
+        (yr["Closed_Date"] > yr["Prospect_Renewal_Date"]) &
+        (yr["Closed_Date"] <= yr["Prospect_Renewal_Date"] + pd.Timedelta(days=28))
+    )
+    base = yr[
+        (yr["_closed_within_4w"]) &
+        (yr["Prospect_Outcome"].isin(["Won", "Churned"]))
+    ][[c for c in BILLING_KEEP_COLS if c in yr.columns]].copy()
 
     if len(base) == 0:
-        raise ValueError(f"No Won customers for Renewal_Year={renewal_year}")
+        raise ValueError(f"No customers in 4-week post-renewal window for Renewal_Year={renewal_year}")
 
     base["is_first_year"] = base["Last_Total_Net_Paid"].isna().astype(int)
-    base["payment_unknown"] = base["Payment_Method"].str.strip().str.upper().eq("UNKNOWN").astype(int)
     base["auto_renewal_off"] = (~base["Current_Auto_Renewal_Flag"].str.strip().str.upper().eq("YES")).astype(int)
-    base["has_world_pay_token"] = base["Current_World_Pay_Token"].notna().astype(int)
-    base["payment_timeframe_known"] = base["Payment_Timeframe"].notna().astype(int)
+
+    # Removed (post-outcome leakage): payment_unknown, payment_timeframe_known,
+    # has_world_pay_token, price_change_pct, price_increased/decreased,
+    # Total_Renewal_Score_New derivatives (renewal_score_delta, low_renewal_score)
+
     base["anchoring_zero"] = (base["Current_Anchorings"] == 0).astype(int)
     base["anchoring_1plus"] = (base["Current_Anchorings"] >= 1).astype(int)
     base["anchoring_3plus"] = (base["Current_Anchorings"] >= 3).astype(int)
@@ -77,16 +108,8 @@ def build_billing_features(bills: pd.DataFrame, renewal_year: int) -> pd.DataFra
     base["band_downgraded"] = (base["band_enc"] < last_band_enc).astype(int)
     base["band_upgraded"] = (base["band_enc"] > last_band_enc).astype(int)
 
-    safe_last = base["Last_Total_Net_Paid"].replace(0, np.nan)
-    base["price_change_pct"] = ((base["Total_Net_Paid"] - base["Last_Total_Net_Paid"]) / safe_last).fillna(0).clip(-1, 5)
-    base["price_increased"] = (base["price_change_pct"] > 0.01).astype(int)
-    base["price_increase_10pct"] = (base["price_change_pct"] > 0.10).astype(int)
-    base["price_increase_20pct"] = (base["price_change_pct"] > 0.20).astype(int)
-    base["price_decreased"] = (base["price_change_pct"] < -0.01).astype(int)
-
-    base["renewal_score_delta"] = (base["Total_Renewal_Score_New"] - base["Renewal_Score_At_Release"]).fillna(0)
-    q25 = base["Total_Renewal_Score_New"].quantile(0.25)
-    base["low_renewal_score"] = (base["Total_Renewal_Score_New"] < q25).astype(int)
+    q25 = base["Renewal_Score_At_Release"].quantile(0.25)
+    base["low_release_score"] = (base["Renewal_Score_At_Release"] < q25).astype(int)
 
     base["tenure_0_1"] = (base["Tenure_Years"] <= 1).astype(int)
     base["tenure_2_3"] = ((base["Tenure_Years"] >= 2) & (base["Tenure_Years"] <= 3)).astype(int)
@@ -96,51 +119,9 @@ def build_billing_features(bills: pd.DataFrame, renewal_year: int) -> pd.DataFra
     return base.reset_index(drop=True)
 
 
-def build_email_features(emails: pd.DataFrame, co_ref_set: set, time_window: str = "prior_year") -> pd.DataFrame:
-    """Aggregate emails to one row per customer."""
-    filtered = emails[
-        (emails["Co_Ref"].isin(co_ref_set)) &
-        (emails["Time_to_Renewal"] == time_window)
-    ].copy()
-
-    if len(filtered) == 0:
-        return pd.DataFrame(columns=["Co_Ref"])
-
-    sent_col = "crm_contractor_sentiment_clean" if "crm_contractor_sentiment_clean" in filtered.columns else "crm_contractor_sentiment"
-
-    feats = filtered.groupby("Co_Ref").agg(
-        email_ever_suggested_leave=("crm_contractor_suggested_leave", lambda x: int((x=="Yes").any())),
-        email_ever_competitor=("crm_competitors_mentioned", lambda x: int((x=="Yes").any())),
-        email_ever_price_dissatisfied=("crm_dissatisified_with_renewal_price", lambda x: int((x=="Yes").any())),
-        email_ever_complained=("crm_customer_complained", lambda x: int((x=="Yes").any())),
-        email_ever_financial_hardship=("crm_financial_hardship_mentioned", lambda x: int((x=="Yes").any())),
-        email_ever_refund_mentioned=("crm_refund_mentioned", lambda x: int((x=="Yes").any())),
-        email_ever_overdue=("crm_membership_overdue", lambda x: int((x=="Yes").any())),
-        email_ever_negative_exp=("crm_negative_customer_experience", lambda x: int((x=="Yes").any())),
-        email_ever_dissatisfied_support=("crm_dissatisfaction_with_support", lambda x: int((x=="Yes").any())),
-        email_pct_negative=(sent_col, lambda x: (x=="Negative").mean()),
-        email_pct_positive=(sent_col, lambda x: (x=="Positive").mean()),
-        email_avg_sentiment_score=("crm_contractor_sentiment_score", lambda x: pd.to_numeric(x, errors="coerce").mean()),
-        email_min_sentiment_score=("crm_contractor_sentiment_score", lambda x: pd.to_numeric(x, errors="coerce").min()),
-        email_count=("Co_Ref", "count"),
-        email_agent_chase_total=("crm_agent_chase_count", lambda x: pd.to_numeric(x, errors="coerce").sum()),
-        email_pct_not_engaged=("crm_contractor_engagement", lambda x: (x=="No").mean()),
-        email_ever_platform_issue=("crm_platform_issues_raised", lambda x: int((x=="Yes").any())),
-    ).reset_index()
-
-    feats["email_high_risk_flag"] = (
-        (feats["email_ever_suggested_leave"]==1) |
-        (feats["email_ever_competitor"]==1) |
-        (feats["email_pct_negative"]>0.5)
-    ).astype(int)
-
-    feats["email_total_negative_flags"] = feats[[
-        "email_ever_suggested_leave","email_ever_competitor","email_ever_price_dissatisfied",
-        "email_ever_complained","email_ever_financial_hardship","email_ever_refund_mentioned",
-        "email_ever_overdue","email_ever_negative_exp"
-    ]].sum(axis=1)
-
-    return feats
+# NOTE: build_email_features() has been removed.
+# Email data (emails.year = Renewal_Year + 1) arrives AFTER the post-renewal
+# decision window and would constitute temporal leakage if used as features.
 
 
 def build_cc_features(cc: pd.DataFrame, co_ref_set: set, call_year: int) -> pd.DataFrame:
@@ -205,14 +186,28 @@ def build_rc_features(rc: pd.DataFrame, co_ref_set: set, call_year: int) -> pd.D
 
 
 def build_labels(bills: pd.DataFrame, renewal_year: int) -> pd.DataFrame:
-    """Build churn labels by looking up next year outcome."""
-    next_year = renewal_year + 1
-    next_bills = bills[bills["Renewal_Year"]==next_year][["Co_Ref","Prospect_Outcome"]]
-    next_bills = next_bills.rename(columns={"Prospect_Outcome":"outcome_next_year"})
-    base_ids = bills[(bills["Renewal_Year"]==renewal_year) & (bills["Prospect_Outcome"]=="Won")][["Co_Ref"]]
-    merged = base_ids.merge(next_bills, on="Co_Ref", how="left")
-    merged["churn_label"] = (merged["outcome_next_year"] != "Won").astype(int)
-    return merged[["Co_Ref","churn_label","outcome_next_year"]]
+    """Build churn labels from same-year Prospect_Outcome within the 4-week
+    post-renewal window.
+
+    Won  → 0 (retained)
+    Churned → 1 (churned)
+    Open outcomes are excluded upstream in build_billing_features.
+    """
+    yr = bills[bills["Renewal_Year"] == renewal_year].copy()
+
+    # ── apply the same 4-week post-renewal window ────────────────────────────
+    yr["_closed_within_4w"] = (
+        (yr["Closed_Date"] > yr["Prospect_Renewal_Date"]) &
+        (yr["Closed_Date"] <= yr["Prospect_Renewal_Date"] + pd.Timedelta(days=28))
+    )
+    cohort = yr[
+        (yr["_closed_within_4w"]) &
+        (yr["Prospect_Outcome"].isin(["Won", "Churned"]))
+    ][["Co_Ref", "Prospect_Outcome"]].copy()
+
+    cohort["churn_label"] = (cohort["Prospect_Outcome"] == "Churned").astype(int)
+    cohort = cohort.rename(columns={"Prospect_Outcome": "outcome_post_renewal"})
+    return cohort[["Co_Ref", "churn_label", "outcome_post_renewal"]]
 
 
 def add_composite_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -221,39 +216,32 @@ def add_composite_features(df: pd.DataFrame) -> pd.DataFrame:
     z = pd.Series(0, index=df.index)
 
     df["any_leave_signal"] = (
-        (df.get("email_ever_suggested_leave", z)==1) |
         (df.get("cc_ever_suggest_leave", z)==1) |
         (df.get("rc_switching_intent", z)==1)
     ).astype(int)
 
     df["any_competitor_signal"] = (
-        (df.get("email_ever_competitor", z)==1) |
         (df.get("rc_competitor_mentioned", z)==1)
     ).astype(int)
 
     df["any_financial_hardship"] = (
-        (df.get("email_ever_financial_hardship", z)==1) |
         (df.get("cc_ever_hardship", z)==1)
     ).astype(int)
 
     df["any_complaint"] = (
-        (df.get("email_ever_complained", z)==1) |
         (df.get("cc_ever_complained", z)==1)
     ).astype(int)
 
     neg_flag_cols = [
-        "email_ever_suggested_leave","email_ever_competitor","email_ever_price_dissatisfied",
-        "email_ever_complained","email_ever_financial_hardship","email_ever_refund_mentioned",
-        "email_ever_overdue","cc_ever_suggest_leave","cc_ever_hardship","cc_ever_complained",
+        "cc_ever_suggest_leave","cc_ever_hardship","cc_ever_complained",
         "cc_ever_platform_issues","cc_ever_pricing","rc_discount_requested",
         "rc_competitor_mentioned","rc_switching_intent","rc_rescheduled","rc_agent_flagged",
-        "auto_renewal_off","payment_unknown","anchoring_zero","price_increase_10pct",
+        "auto_renewal_off","anchoring_zero",
     ]
     existing = [c for c in neg_flag_cols if c in df.columns]
     df["total_negative_flags"] = df[existing].sum(axis=1)
 
     df["total_contact_count"] = (
-        df.get("email_count", z) +
         df.get("cc_call_count", z) +
         df.get("rc_call_count", z)
     )
@@ -275,7 +263,6 @@ def add_composite_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_cohort_features(
     bills: pd.DataFrame,
-    emails: pd.DataFrame,
     cc: pd.DataFrame,
     rc: pd.DataFrame,
     renewal_year: int,
@@ -284,23 +271,25 @@ def build_cohort_features(
     """
     Build complete feature table for any cohort year.
 
-    renewal_year=2024 → training set (labels from 2025)
-    renewal_year=2025 → test + predict set (labels from 2026, partial)
-    include_labels=False → production scoring mode
+    Cohort = customers whose deal closed within 4 weeks after
+    Prospect_Renewal_Date, with Prospect_Outcome in {Won, Churned}.
+
+    Uses billing, cc_calls, and renewal_calls only.
+    Email data is excluded (temporal leakage — arrives after renewal decision).
+
+    include_labels=True  → churn_label column added (Won→0, Churned→1)
+    include_labels=False → production scoring mode (no label)
     """
     base = build_billing_features(bills, renewal_year)
     co_ref_set = set(base["Co_Ref"])
     n = len(base)
-    print(f"[{renewal_year}] Base: {n:,} customers")
+    print(f"[{renewal_year}] Base (4-week post-renewal window): {n:,} customers")
 
-    email_feats = build_email_features(emails, co_ref_set)
     cc_feats = build_cc_features(cc, co_ref_set, call_year=renewal_year)
     rc_feats = build_rc_features(rc, co_ref_set, call_year=renewal_year)
-    print(f"[{renewal_year}] Coverage — emails:{len(email_feats):,} "
-          f"cc:{len(cc_feats):,} rc:{len(rc_feats):,}")
+    print(f"[{renewal_year}] Coverage — cc:{len(cc_feats):,} rc:{len(rc_feats):,}")
 
     df = base.copy()
-    df = df.merge(email_feats, on="Co_Ref", how="left")
     df = df.merge(cc_feats,    on="Co_Ref", how="left")
     df = df.merge(rc_feats,    on="Co_Ref", how="left")
 
@@ -311,7 +300,7 @@ def build_cohort_features(
 
     assert len(df) == n, f"Row count changed: {len(df)} != {n}"
     assert df["Co_Ref"].duplicated().sum() == 0, "Duplicate Co_Refs"
-    print(f"[{renewal_year}] Final: {df.shape} ✓")
+    print(f"[{renewal_year}] Final: {df.shape} OK")
 
     if include_labels:
         labels = build_labels(bills, renewal_year)
