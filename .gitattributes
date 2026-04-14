@@ -1,5 +1,6 @@
 # Set line endings to LF for Jupyter notebooks to avoid warnings
 *.ipynb text eol=lf
+*.py text eol=lf
 
 # Default for other text files (optional, but good practice)
 * text=auto
