@@ -32,3 +32,4 @@ venv.bak/
 # Data files
 data/raw/*.csv
 data/**/*.parquet
+data/*
