@@ -1,0 +1,10 @@
+Hypothesis,Feature,Test,p-value,Effect Size,Churn if 0,Churn if 1,Lift (1 vs 0),Significant,Mean Retained,Mean Churned
+H1,anchoring_zero,Chi-square,0.0,0.1483,7.6,18.9,2.5,✓,,
+H2,auto_renewal_off,Chi-square,0.0,0.2539,7.8,40.8,5.21,✓,,
+H3,price_increase_10pct,Chi-square,0.0,0.0407,10.4,7.8,0.75,✓,,
+H4,any_leave_signal,Chi-square,0.0,0.1594,8.3,26.3,3.17,✓,,
+H5,any_competitor_signal,Chi-square,0.001781,0.0178,9.5,12.1,1.27,✓,,
+H7,payment_unknown,Chi-square,1.0,,9.6,,,✗,,
+H6,Tenure_Years,Mann-Whitney,0.0,0.1293,,,,✓,7.317,5.138
+H8,email_pct_negative,Mann-Whitney,0.0,0.0319,,,,✓,0.056,0.12
+H9,total_negative_flags,Mann-Whitney,0.0,0.1293,,,,✓,1.484,2.278
